@@ -1,0 +1,349 @@
+******************************************************************************************************
+########################################### Backup Info ##############################################
+******************************************************************************************************
+
+select f.physical_device_name, b.database_name, b.type as BakType
+, b.backup_start_date, b.backup_finish_date
+, DATEDIFF(ss, b.backup_start_date, b.backup_finish_date) as DurationSec
+, b.backup_size/1024/1024/1024 as BackupSize_GB
+from msdb..backupset b
+join
+msdb..backupmediafamily f
+on(b.media_set_id = f.media_set_id)
+where b.type = 'D' 
+--and b.backup_finish_date > '2019/10/04'
+--and f.physical_device_name not like '%_1'
+order by b.backup_finish_date desc
+
+******************************************************************************************************
+
+
+
+******************************************************************************************************
+########################################### Generic Info #############################################
+******************************************************************************************************
+select 
+@@SERVERNAME as SQLInstanceName,
+SERVERPROPERTY('ProductVersion') as ProductVersion,
+SERVERPROPERTY('Edition') as ProductEdition,
+SERVERPROPERTY('Collation') as ProductCollation,
+cpu_count, hyperthread_ratio, socket_count, cores_per_socket,
+physical_memory_kb/1024 as TotalMemory_MB,
+case when locked_page_allocations_kb > 0 THEN 'ENABLED' ELSE 'DISABLED' END as LPIM,
+c1.value as [Min_SQLMemory_MB], c2.value as [Max_SQLMemory_MB]
+from 
+sys.dm_os_sys_info i, sys.dm_os_process_memory pm, sys.sysconfigures c1, sys.sysconfigures c2
+where
+c1.comment like 'Minimum size of server memory (MB)'
+and c2.comment like 'Maximum size of server memory (MB)'
+
+******************************************************************************************************
+
+******************************************************************************************************
+######################################## Fix Orphaned Users ##########################################
+******************************************************************************************************
+
+Declare @orphuser nvarchar(100);
+Declare @a int;
+Create table ##orphfix
+(orphusers nvarchar(100), usid varbinary(100))
+INSERT INTO ##orphfix(orphusers, usid)
+Exec..sp_change_users_login @Action = 'report'
+
+
+select @orphuser = min(orphusers) from ##orphfix
+while @orphuser is NOT NULL
+BEGIN
+            EXEC..sp_change_users_login 
+            @Action = 'Update_one', 
+            @UserNamePattern = @orphuser, 
+            @LoginName = @orphuser
+            
+            select @orphuser = min(orphusers) from ##orphfix where orphusers > @orphuser
+END
+go
+DROP TABLE ##orphfix
+
+----*#### Dynamic ####*------
+
+
+DECLARE @dbname nvarchar(100)
+DECLARE @cmd nvarchar(4000)
+DECLARE db cursor for
+select name from sys.databases where database_id > 4
+
+OPEN db
+FETCH NEXT from db into @dbname
+while @@FETCH_STATUS = 0
+BEGIN
+
+select @cmd = 'use [' + @dbname + ']
+				Declare @orphuser nvarchar(100);
+				Declare @a int;
+				Create table ##orphfix
+				(orphusers nvarchar(100), usid varbinary(100))
+				INSERT INTO ##orphfix(orphusers, usid)
+				Exec..sp_change_users_login @Action = ''report''
+
+
+				select @orphuser = min(orphusers) from ##orphfix
+				while @orphuser is NOT NULL
+				BEGIN
+							EXEC..sp_change_users_login 
+							@Action = ''Update_one'', 
+							@UserNamePattern = @orphuser, 
+							@LoginName = @orphuser
+            
+							select @orphuser = min(orphusers) from ##orphfix where orphusers > @orphuser
+				END
+				DROP TABLE ##orphfix
+				go
+				
+				'
+PRINT (@cmd)
+
+FETCH next from db into @dbname
+END
+
+close db
+deallocate db
+
+
+******************************************************************************************************
+
+
+******************************************************************************************************
+######################################## UserExtract SQL2000 #########################################
+******************************************************************************************************
+
+--sp_change_users_login @action = 'report'
+--select SUSER_NAME(0x010500000000000515000000FCE315312AD0375C75B9755440F40000)
+
+SET NOCOUNT ON;
+
+DECLARE @dbn varchar(100);
+DECLARE @dbowner varchar(100);
+DECLARE @applydbo varchar(500);
+select @dbn = (select DB_NAME());
+select '<<<<####---- Database Name: ' + @dbn + ' ----####>>>>'
+select @dbowner = (SELECT SUSER_SNAME(sid) from master..sysdatabases where name = DB_NAME())
+
+--Apply DB Owner permission--
+--select @dbowner;
+select @applydbo = ('use [' + @dbn + '] EXEC..sp_changedbowner ''' + @dbowner + '''')
+select @applydbo
+
+
+IF EXISTS(select name from tempdb..sysobjects where name like '##userextract' and type = 'U')
+BEGIN
+DROP table ##userextract
+END
+
+CREATE table ##userextract
+(UserID varchar(100), Privilege varchar(50), LoginID varchar(100), DefDB varchar(50), UID int, SID varbinary(100))
+INSERT INTO ##userextract
+EXEC..sp_helpuser
+
+--select * from ##userextract
+--drop table ##userextract
+
+select 'IF NOT EXISTS (select name from sysusers where name = ''' + UserID + ''')' + char(10) + ' BEGIN ' + CHAR(10) +
+'EXEC..sp_adduser ''' + SUSER_SNAME(SID) + ''', ''' + UserID + ''';' + char(10) + 'END' from ##userextract
+where UID > 4 
+and LoginID <> 'NULL' 
+ORDER BY UserID
+select 'EXEC..sp_addrolemember ''' + Privilege + ''', ''' + UserID + ''';' from ##userextract
+where UID > 4
+
+drop table ##userextract
+
+SET NOCOUNT OFF;
+
+******************************************************************************************************
+
+
+******************************************************************************************************
+######################################## UserExtract SQL2K5+ #########################################
+******************************************************************************************************
+
+
+SET NOCOUNT ON;
+	
+select getdate() as ExtractDateTime;
+
+            --Gather DB owner info--
+            DECLARE @dbn varchar(100);
+            DECLARE @dbowner varchar(100);
+            DECLARE @applydbo varchar(500);
+            select @dbn = (select DB_NAME());
+            select '<<<<####---- Database Name: ' + @dbn + ' ----####>>>>'
+            select @dbowner = (SELECT SUSER_SNAME(sid) from master..sysdatabases where name = DB_NAME())
+            --select @dbowner;
+            
+
+            --Gather DB Users info--
+            SELECT 'IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = '''+ name + ''') ' + char(13)
+            + 'BEGIN ' + char(13)
+            + 'CREATE USER [' + name + ']'  + ' FOR LOGIN [' +  name + ']' + char(13)
+            + ' END' + char(13)
+            FROM sys.database_principals 
+            WHERE 
+            principal_id > 4 
+            and type <> 'R' 
+            and name not like 'guest'
+            and name not like 'dbo'
+            and name not like 'public'
+            and name not like 'INFORMATION_SCHEMA'
+            and name not like 'sys'
+
+            
+            --Gather DB user privilege info--
+            select 'EXEC..sp_addrolemember ''' + USER_NAME(r.role_principal_id) + ''', ''' + USER_NAME(r.member_principal_id) + ''''
+            from sys.database_role_members r
+            where
+            r.member_principal_id in
+            (SELECT principal_id
+            FROM sys.database_principals 
+            WHERE 
+            principal_id > 4 
+            and type <> 'R' 
+            and name not like 'guest'
+            and name not like 'dbo'
+            and name not like 'public'
+            and name not like 'INFORMATION_SCHEMA'
+            and name not like 'sys')
+
+
+            --Gather object level permission--
+            select per.state_desc + ' ' + per.permission_name + ' ON [' + OBJECT_NAME(per.major_id) 
+            + '] TO [' + pri.name collate DATABASE_DEFAULT + '];'
+            from sys.database_permissions per
+            join sys.database_principals pri
+            ON(per.grantee_principal_id = pri.principal_id)
+            where 
+            major_id > 0 and pri.principal_id > 4 and per.class = 1
+            order by pri.principal_id
+
+
+            --Gather db connect permission of users--
+            select per.state_desc + ' ' + per.permission_name + ' TO [' + pri.name collate DATABASE_DEFAULT + '];'
+            from sys.database_permissions per
+            join sys.database_principals pri
+            ON(per.grantee_principal_id = pri.principal_id)
+            where 
+            pri.principal_id > 4 and per.class = 0
+            order by pri.principal_id
+
+            --Apply DB Owner permission--
+            --select @dbowner;
+            select @applydbo = ('use [' + @dbn + '] EXEC..sp_changedbowner ''' + @dbowner + '''')
+            select @applydbo
+
+--select * from sys.database_permissions
+SET NOCOUNT OFF;
+
+
+******************************************************************************************************
+
+
+*****************************************************************************************************
+################################# Server level permission extracts ##################################
+*****************************************************************************************************
+
+	SET NOCOUNT on;
+	select '--SQL Instance: ' + @@SERVERNAME;
+	select '--Extract Date: ' + CONVERT(nvarchar(50),GETDATE());
+            
+			
+	--Server roles extract--
+	select '--###### Extract Server role of Logins ######--'
+	select 'ALTER SERVER ROLE ' + SUSER_NAME(r.role_principal_id) + ' ADD MEMBER [' + SUSER_NAME	(r.member_principal_id) + ']'
+	from sys.server_role_members r
+	where
+	r.member_principal_id in
+	(SELECT principal_id
+	FROM sys.server_principals
+	WHERE 
+	principal_id > 4 
+	and type <> 'R' 
+	and name not like 'sa'
+	and name not like 'wow_sa'
+	and name not like 'NT SERVICE\*'
+	and name not like '*##*'
+	)
+
+
+	--Explicit Server Permissions--
+	select '--###### Extract explicit server permissions of Logins ######--'
+	select per.state_desc + ' ' + per.permission_name + ' TO [' + pri.name collate DATABASE_DEFAULT + '];'
+	from sys.server_permissions per
+	join sys.server_principals pri
+	ON(per.grantee_principal_id = pri.principal_id)
+	where 
+	per.class = 100 and pri.name not like '##*' and pri.type not in ('C')
+	order by pri.principal_id
+
+	SET NOCOUNT off;
+
+
+******************************************************************************************************
+
+
+******************************************************************************************************
+######################################## AG Add/Remove DBs ##########################################
+******************************************************************************************************
+
+Add db into AAG in Primary Replica
+-----------------------------------
+ALTER AVAILABILITY GROUP MPCCCUSP09PAG ADD DATABASE [MPCC_Clb_Search_Property_DB];
+go
+
+Add db into AAG in Secondary Replica
+-----------------------------------
+ALTER DATABASE <dbNAME> SET HADR AVAILABILITY GROUP = <AAG>;
+go
+
+Remove secondary dbs from AAG
+------------------------------
+ALTER DATABASE <DBName> SET HADR OFF;
+GO
+
+Remove Primary dbs from AAG
+------------------------------
+ALTER AVAILABILITY GROUP <AAGname> REMOVE DATABASE <DBName>;
+go
+
+
+ADD/Remove Replica
+-----------------------------
+ALTER AVAILABILITY GROUP azwmsndbaag001 REMOVE REPLICA ON 'azwmsndba00002';  
+
+ALTER AVAILABILITY GROUP azwmsndbaag001 ADD REPLICA ON 'azwmsndba00002'   
+   WITH (  
+         ENDPOINT_URL = 'TCP://azwmsndba00002.wowcorp.com.au:5022',  
+         AVAILABILITY_MODE = SYNCHRONOUS_COMMIT,  
+         FAILOVER_MODE = MANUAL  
+         );  
+
+
+ALTER AVAILABILITY GROUP azwmsndbaag001 JOIN;  
+
+
+select 
+'ALTER AVAILABILITY GROUP [' + r.name + '] ADD database ' + DB_NAME(database_id) + '', --
+'ALTER database [' + DB_NAME(database_id) + '] SET HADR AVAILABILITY GROUP = ' + r.name + '',
+'ALTER AVAILABILITY GROUP [' + r.name + '] REMOVE database ' + DB_NAME(database_id) + '',
+'ALTER database [' + DB_NAME(database_id) + '] SET HADR OFF',
+*
+from sys.dm_hadr_database_replica_states dr
+join sys.availability_groups r on dr.group_id = r.group_id
+where is_local = 1
+
+select
+'RESTORE database [' + name + '] with recovery',
+'ALTER AVAILABILITY GROUP [AZDWECFDBAAG001] ADD database [' + name + ']',
+'ALTER database [' + name + '] SET HADR AVAILABILITY GROUP = AZDWECFDBAAG001'
+from sys.databases where state = 1
+and name not like '%Payments%'
+
+******************************************************************************************************
